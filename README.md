@@ -1,65 +1,66 @@
-# Astral - Rail Power Monitor
+# Astral Power Monitor for Windows
 
-This Rust application reads voltage and current from Astral GPUs from on-board ITE IT8915FN chip through NVAPI I2C communication protocol.
+A small native Rust tray application for ASUS Astral per-pin power monitoring,
+extended from [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-power-monitoring).
 
-## Requirements
+## What it does
 
-- Windows 10/11 (64-bit)
-- ASUS Astral RTX 5080/5090 GPU (only 5090 tested)
-- NVIDIA Driver installed
-- Rust toolchain (stable)
+- Displays current, voltage, calculated power, and session peak current for all six power pins.
+- Shows total connector power and the highest pin current.
+- Samples twice per second on a worker thread, independently of the window.
+- Marks readings unavailable after a read failure or three seconds without a fresh sample.
+- Reconnects every five seconds after sensor/driver failures.
+- Displays a warning at 9.2 A; this is a display warning, not an automatic intervention.
+- Saves a CSV sample about once per second to `%LOCALAPPDATA%\AstralPowerMonitor\readings.csv`.
+- Rotates the CSV at 5 MiB and retains three older files.
+- Allows only one GUI instance per Windows session.
 
-## Building
+**This version is monitoring only. It does not change clocks, voltage, power limits,
+or fan speeds, and does not shut Windows down.** Current readings are not connector
+temperature measurements or a guarantee against connector damage.
 
-```bash
-cargo build --release
+## Using the app
+
+Launch `AstralPowerMonitor.exe` (the release build is named `astral_power_monitoring.exe`).
+Closing the window hides it while monitoring continues. Click the tray icon to show it.
+Right-click the tray icon or the readings window for Show readings, Open CSV history,
+Reset session peaks, and Quit. Launching it again restores the existing window.
+
+Use `--tray` to start with the window hidden. No autostart task is installed automatically.
+
+For a bounded console snapshot in PowerShell:
+
+```powershell
+& .\target\release\astral_power_monitoring.exe --once | Out-String
+& .\target\release\astral_power_monitoring.exe --samples 3 | Out-String
 ```
 
-## Running
+## Build and validate
 
-```bash
-cargo run --release
+Requires x64 Windows 10/11, Rust 1.88 or later, the MSVC toolchain/Windows SDK,
+and an installed NVIDIA driver. Python, HWiNFO, and administrator access are not required.
+
+```powershell
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --release --locked
 ```
 
-## How it works
+The native interface uses Windows controls and GDI. The compiled executable is roughly
+300 KiB. Sensor access uses NVIDIA's installed NVAPI driver library.
 
-Astral 5080 and 5090 graphic cards from ASUS contain additional sensors, which can be accessed through on-board ITE IT8915FN chip via I2C protocol. We can use NVAPI for this, but the documented NvAPI_I2CRead only allows communication via DDC port. This is why we have to go through undocumented NvAPI_I2CReadEx, which can read via I2C port.
+The tests do not access GPU hardware. They cover pin ordering and units, malformed packets,
+high-current readings, stale/disconnected state, card selection, the native request layout,
+and CSV writing/rotation. Live hardware validation is a separate `--once` check.
 
-NvAPI is not supported on linux, but there is a better way to fetch data from the chip, because Linux kernel exposes some functions to communicate via I2C. Create an issue if you are interested in this.
+## Sensor protocol and supported cards
 
-## Register Information
+The IT8915FN sensor is read through `NvAPI_I2CReadEx`, address `0x2B`, register `0x80`,
+port 1. The 24-byte response contains six reversed blocks of big-endian millivolts
+and milliamps. Pin 1 is at bytes 20–23 and Pin 6 at bytes 0–3.
 
-Based on the SMBus dump:
-
-- **Bus 4, Address 0x2B**: ITE IT8915FN
-- **Registers 0x80-0x9F**: Current/Voltage monitoring data
-
-24 bytes from register 0x80, organized as 6 rails with 4 bytes each (16-bit big-endian voltage + 16-bit big-endian current in millivolts and milliamps). The order appears to be reversed:
-
-```
-Byte Layout:
-  0-1: Rail 0 Voltage    →  Pin 6 Voltage
-  2-3: Rail 0 Current    →  Pin 6 Current
-  4-5: Rail 1 Voltage    →  Pin 5 Voltage
-  6-7: Rail 1 Current    →  Pin 5 Current
-  8-9: Rail 2 Voltage    →  Pin 4 Voltage
-10-11: Rail 2 Current    →  Pin 4 Current
-12-13: Rail 3 Voltage    →  Pin 3 Voltage
-14-15: Rail 3 Current    →  Pin 3 Current
-16-17: Rail 4 Voltage    →  Pin 2 Voltage
-18-19: Rail 4 Current    →  Pin 2 Current
-20-21: Rail 5 Voltage    →  Pin 1 Voltage
-22-23: Rail 5 Current    →  Pin 1 Current
-```
-
-## Future plans
-
-- Expose or push data to Prometheus/InfluxDB
-- GUI implementation
-- Notifications, visual and audio alerts
-- Shut down all programs using the graphics card
-
-## References
-
-- NVAPI I2C Documentation
-- `ExpanModule.dll` reverse engineering
+The reader selects the first supported ASUS subsystem ID rather than assuming GPU 0.
+Supported IDs include the Astral 5090 OC, OC White, LC, 5090D OC, Matrix 5090,
+and the listed Astral 5080 variants. The OC White model was checked on real hardware.
+BTF models are excluded because slot power can bypass their cable sensors.
+No I2C write function is bound.

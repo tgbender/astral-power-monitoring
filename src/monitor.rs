@@ -1,179 +1,117 @@
-use std::mem;
-
-use nvapi_sys::gpu::NvAPI_EnumPhysicalGPUs;
+//! Read-only IT8915 sensor access. No I2C writes are bound.
+use crate::model::Reading;
+use nvapi_sys::gpu::{NvAPI_EnumPhysicalGPUs, NvAPI_GPU_GetPCIIdentifiers};
 use nvapi_sys::handles::NvPhysicalGpuHandle;
-use nvapi_sys::i2c::{NV_I2C_INFO_VER3, NVAPI_I2C_SPEED_100KHZ, NVAPI_I2C_SPEED_DEPRECATED};
 use nvapi_sys::i2c::private::{NV_I2C_INFO_EX_V3, NvAPI_I2CReadEx};
+use nvapi_sys::i2c::{NV_I2C_INFO_VER3, NVAPI_I2C_SPEED_100KHZ, NVAPI_I2C_SPEED_DEPRECATED};
+use nvapi_sys::nvapi::{NvAPI_Initialize, NvAPI_Unload};
 use nvapi_sys::status::NVAPI_OK;
 use nvapi_sys::types::NVAPI_MAX_PHYSICAL_GPUS;
 
-// IT8915 Power Monitoring IC constants
-const IT8915_I2C_ADDRESS: u8 = 0x2B << 1; // I2C device address (0x2B), shifted by one to the left
-const IT8915_POWER_REG_START: u8 = 0x80; // Starting register for power readings (0x80)
-const IT8915_POWER_DATA_SIZE: usize = 24; // 24 bytes of power data (6 pins * 2B voltage * 2B current)
-
 pub struct AstralPowerMonitor {
-    gpu_handles: Vec<NvPhysicalGpuHandle>,
+    handle: NvPhysicalGpuHandle,
+    pub name: &'static str,
 }
-
+pub fn model_for_id(id: u32) -> Option<&'static str> {
+    Some(match id {
+        0x89e31043 => "ROG Astral RTX 5090 OC",
+        0x8a2e1043 => "ROG Astral RTX 5090 OC White",
+        0x89ec1043 => "ROG Astral RTX 5090 LC",
+        0x89ea1043 => "ROG Astral RTX 5090D OC",
+        0x8a611043 => "ROG Matrix RTX 5090",
+        0x89de1043 => "ROG Astral RTX 5080 OC",
+        0x8a2b1043 => "ROG Astral RTX 5080 OC White",
+        0x8a451043 => "ROG Astral RTX 5080 Hatsune Miku",
+        0x89df1043 => "ROG Astral RTX 5080",
+        // BTF slot-powered cards bypass the sensor: do not claim support.
+        _ => return None,
+    })
+}
 impl AstralPowerMonitor {
-    /// Initialize NVAPI and enumerate GPUs
     pub fn new() -> Result<Self, String> {
-        let mut gpu_handles = [unsafe { mem::zeroed() }; NVAPI_MAX_PHYSICAL_GPUS as usize];
-        let mut gpu_count: u32 = 0;
-
-        let status = unsafe { NvAPI_EnumPhysicalGPUs(&mut gpu_handles, &mut gpu_count) };
+        if std::mem::size_of::<NV_I2C_INFO_EX_V3>() != 64 {
+            return Err("Unsupported sensor structure layout; x64 Windows is required".into());
+        }
+        let status = unsafe { NvAPI_Initialize() };
         if status != NVAPI_OK {
-            return Err(format!("Failed to enumerate GPUs: status {:?}", status));
+            return Err(format!("NVIDIA initialization failed: {status:?}"));
         }
-
-        if gpu_count == 0 {
-            return Err("No NVIDIA GPUs found".to_string());
+        let result = Self::find_card();
+        if result.is_err() {
+            unsafe { NvAPI_Unload() };
         }
-
-        let gpu_handles_vec = gpu_handles[..gpu_count as usize].to_vec();
-
-        Ok(Self {
-            gpu_handles: gpu_handles_vec,
-        })
+        result
     }
-
-    /// Read raw data from IT8915 power monitoring IC via I2C
-    ///
-    /// # Arguments
-    /// * `gpu_index` - GPU index (0-based)
-    /// * `reg_addr` - IT8915 register address
-    /// * `data` - Buffer to receive data
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(String)` with error message on failure
-    fn read_i2c_data(
-        &self,
-        gpu_index: i32,
-        reg_addr: u8,
-        data: &mut [u8],
-    ) -> Result<(), String> {
-        let gpu_handle = self.gpu_handles[gpu_index as usize];
-
-        let mut reg_addr_buf = reg_addr;
-        let mut i2c_info = NV_I2C_INFO_EX_V3 {
+    fn find_card() -> Result<Self, String> {
+        let mut handles = [unsafe { std::mem::zeroed() }; NVAPI_MAX_PHYSICAL_GPUS];
+        let mut count = 0;
+        let status = unsafe { NvAPI_EnumPhysicalGPUs(&mut handles, &mut count) };
+        if status != NVAPI_OK || count as usize > handles.len() {
+            return Err(format!("NVIDIA GPU enumeration failed: {status:?}"));
+        }
+        for handle in handles.into_iter().take(count as usize) {
+            let (mut device, mut subsystem, mut revision, mut extended) = (0, 0, 0, 0);
+            let status = unsafe {
+                NvAPI_GPU_GetPCIIdentifiers(
+                    handle,
+                    &mut device,
+                    &mut subsystem,
+                    &mut revision,
+                    &mut extended,
+                )
+            };
+            if status == NVAPI_OK
+                && let Some(name) = model_for_id(subsystem)
+            {
+                return Ok(Self { handle, name });
+            }
+        }
+        Err("No supported ASUS Astral sensor-equipped GPU found".into())
+    }
+    pub fn read(&self) -> Result<Reading, String> {
+        let mut data = [0u8; 24];
+        let mut register = 0x80;
+        let mut request = NV_I2C_INFO_EX_V3 {
             version: NV_I2C_INFO_VER3,
             displayMask: 0,
             bIsDDCPort: 0,
-            i2cDevAddress: IT8915_I2C_ADDRESS,
-            // Padding of u16 is added in-between for automatic alignment.
-            pbI2cRegAddress: &mut reg_addr_buf,
+            i2cDevAddress: 0x2b << 1,
+            pbI2cRegAddress: &mut register,
             regAddrSize: 1,
             pbData: data.as_mut_ptr(),
             pbRead: data.len() as u32,
-            // This is probably not cbSize, but deprecated i2cSpeed parameter.
             cbSize: NVAPI_I2C_SPEED_DEPRECATED,
             i2cSpeedKhz: NVAPI_I2C_SPEED_100KHZ,
-            portId: 0x1,
-            bIsPortIdSet: 1
+            portId: 1,
+            bIsPortIdSet: 1,
         };
-
-        let mut i2c_status = 0u32;
-        let status = unsafe { NvAPI_I2CReadEx(gpu_handle, &mut i2c_info, &mut i2c_status) };
-
+        let mut read_status = 0;
+        let status = unsafe { NvAPI_I2CReadEx(self.handle, &mut request, &mut read_status) };
         if status != NVAPI_OK {
-            return Err(format!("I2C read failed: NVAPI status {:?}", status));
+            return Err(format!("Sensor read failed: {status:?}"));
         }
-
-        Ok(())
-    }
-
-    /// Get power status for a specific GPU by reading IT8915 power monitoring IC
-    ///
-    /// # Arguments
-    /// * `gpu_index` - GPU index (0-based)
-    /// * `voltage_buffer` - Buffer to receive 6 power rail voltage values in volts
-    /// * `current_buffer` - Buffer to receive 6 power rail current values in amperes
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(String)` with error message on failure
-    pub fn get_power_status(
-        &self,
-        gpu_index: i32,
-        voltage_buffer: &mut [f32; 6],
-        current_buffer: &mut [f32; 6],
-    ) -> Result<(), String> {
-        if gpu_index < 0 || gpu_index >= self.gpu_handles.len() as i32 {
-            return Err(format!(
-                "Invalid GPU index {}. Valid range: 0-{}",
-                gpu_index,
-                self.gpu_handles.len() - 1
-            ));
-        }
-
-        // Read 24 bytes from IT8915 starting at register 0x80
-        let mut raw_data = [0u8; IT8915_POWER_DATA_SIZE];
-        self.read_i2c_data(gpu_index, IT8915_POWER_REG_START, &mut raw_data)?;
-
-        // Data structure: 6 rails × 4 bytes each = 24 bytes
-        // Each 4-byte block contains:
-        //   Bytes +0,+1: Voltage (16-bit big-endian, millivolts)
-        //   Bytes +2,+3: Current (16-bit big-endian, milliamps)
-        // Note: Order is reversed when fetched via I2C
-
-        // Extract big-endian u16 from byte array
-        let read_u16_be = |offset: usize| -> u16 {
-            ((raw_data[offset] as u16) << 8) | (raw_data[offset + 1] as u16)
-        };
-
-        // Hardware rails are stored in reverse order: Rail 5, 4, 3, 2, 1, 0
-        // Map them to software pins: Pin 0, 1, 2, 3, 4, 5
-        let rail_voltages = [
-            read_u16_be(20), // Pin 0 = Rail 5: bytes 20-21
-            read_u16_be(16), // Pin 1 = Rail 4: bytes 16-17
-            read_u16_be(12), // Pin 2 = Rail 3: bytes 12-13
-            read_u16_be(8),  // Pin 3 = Rail 2: bytes 8-9
-            read_u16_be(4),  // Pin 4 = Rail 1: bytes 4-5
-            read_u16_be(0),  // Pin 5 = Rail 0: bytes 0-1
-        ];
-
-        let rail_currents = [
-            read_u16_be(22), // Pin 0 = Rail 5: bytes 22-23
-            read_u16_be(18), // Pin 1 = Rail 4: bytes 18-19
-            read_u16_be(14), // Pin 2 = Rail 3: bytes 14-15
-            read_u16_be(10), // Pin 3 = Rail 2: bytes 10-11
-            read_u16_be(6),  // Pin 4 = Rail 1: bytes 6-7
-            read_u16_be(2),  // Pin 5 = Rail 0: bytes 2-3
-        ];
-
-        // Convert to volts and amperes (millivolts/milliamps * 0.001)
-        for i in 0..6 {
-            voltage_buffer[i] = (rail_voltages[i] as f32) * 0.001;
-            current_buffer[i] = (rail_currents[i] as f32) * 0.001;
-        }
-
-        Ok(())
-    }
-
-    /// Get the number of available GPUs
-    pub fn gpu_count(&self) -> usize {
-        self.gpu_handles.len()
-    }
-
-    /// Get power status and return as vectors (voltages, currents)
-    #[allow(dead_code)]
-    pub fn get_power_status_vec(&self, gpu_idx: i32) -> Result<(Vec<f32>, Vec<f32>), String> {
-        let mut voltages = [0.0f32; 6];
-        let mut currents = [0.0f32; 6];
-        self.get_power_status(gpu_idx, &mut voltages, &mut currents)?;
-        Ok((voltages.to_vec(), currents.to_vec()))
+        Reading::decode(&data)
     }
 }
-
+impl Drop for AstralPowerMonitor {
+    fn drop(&mut self) {
+        unsafe { NvAPI_Unload() };
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_power_monitor_init() {
-        let monitor = AstralPowerMonitor::new();
-        assert!(monitor.is_ok() || monitor.is_err()); // Will fail on non-NVIDIA systems
+    fn selects_supported_card_and_rejects_unknown_or_btf() {
+        assert_eq!(
+            model_for_id(0x8a2e1043),
+            Some("ROG Astral RTX 5090 OC White")
+        );
+        assert_eq!(model_for_id(0x12341043), None);
+        assert_eq!(model_for_id(0x8a5a1043), None);
+    }
+    #[test]
+    fn validates_request_layout() {
+        assert_eq!(std::mem::size_of::<NV_I2C_INFO_EX_V3>(), 64);
     }
 }
