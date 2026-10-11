@@ -16,6 +16,7 @@ extended from [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-
 - Rotates JSONL at 5 MiB and retains three older files (`readings.1.jsonl` through `.3.jsonl`).
 - Repairs an incomplete final record on startup. Existing CSV history is preserved.
 - Allows only one GUI instance per Windows session.
+- Uses a teal GPU tray/taskbar icon with six gold contacts; warnings use an amber exclamation version.
 - Provides manually armed GPU limiting and Windows power-off protection using the Python guard's default ladder.
 - Plays embedded audio warnings even while protection is disarmed. Audio playback runs separately from sensor reads and protective actions.
 
@@ -148,6 +149,7 @@ For a bounded console snapshot in PowerShell:
 ## Build and validate
 
 Requires x64 Windows 10/11, Rust 1.88 or later, the MSVC toolchain/Windows SDK,
+including `rc.exe` on PATH for embedding application icons,
 and an installed NVIDIA driver. Python and HWiNFO are not required. Administrator access
 is needed for GPU limiting, not read-only monitoring.
 
@@ -158,7 +160,7 @@ cargo build --release --locked
 ```
 
 The native interface uses Windows controls and GDI. The compiled executable, including
-the embedded sounds, is roughly 870 KiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
+the embedded sounds and icon resources, is roughly 1.5 MiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
 NVML loaded exclusively from System32. Control selection requires one unambiguous match
 to the monitored card's subsystem ID, with UUID checks for saved-state restoration.
 

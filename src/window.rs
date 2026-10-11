@@ -26,6 +26,7 @@ const MONITOR_ONLY: u32 = WM_APP + 2;
 const CLASS: &str = "AstralPowerMonitorRustWindow";
 
 struct App {
+    icons: Icons,
     shared: Shared,
     controls: Controls,
     font: HFONT,
@@ -33,6 +34,62 @@ struct App {
     big_font: HFONT,
     menu: HMENU,
     taskbar_created: u32,
+}
+struct Icons {
+    normal: HICON,
+    warning: HICON,
+    big: HICON,
+}
+impl Icons {
+    unsafe fn load(instance: HINSTANCE) -> Result<Self, String> {
+        let mut icons = Self {
+            normal: null_mut(),
+            warning: null_mut(),
+            big: null_mut(),
+        };
+        let load = |resource: u16, width: i32, height: i32| {
+            let handle = unsafe {
+                LoadImageW(
+                    instance,
+                    resource as usize as *const u16,
+                    IMAGE_ICON,
+                    width,
+                    height,
+                    0,
+                )
+            };
+            if handle.is_null() {
+                Err("Cannot load embedded GPU icons".to_string())
+            } else {
+                Ok(handle)
+            }
+        };
+        unsafe {
+            icons.normal = load(
+                1,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+            )?;
+            icons.warning = load(
+                2,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+            )?;
+            icons.big = load(1, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON))?;
+        }
+        Ok(icons)
+    }
+}
+impl Drop for Icons {
+    fn drop(&mut self) {
+        unsafe {
+            for icon in [self.normal, self.warning, self.big] {
+                if !icon.is_null() {
+                    DestroyIcon(icon);
+                }
+            }
+        }
+    }
 }
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
 fn wide(text: &str) -> Vec<u16> {
@@ -104,14 +161,20 @@ unsafe fn notify(hwnd: HWND, operation: u32, tip: &str, warning: bool) -> bool {
         info.uID = 1;
         info.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         info.uCallbackMessage = TRAY_MESSAGE;
-        info.hIcon = LoadIconW(
-            null_mut(),
-            if warning {
-                IDI_WARNING
-            } else {
-                IDI_INFORMATION
-            },
-        );
+        info.hIcon = APP.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|app| {
+                    app.as_ref().map(|app| {
+                        if warning {
+                            app.icons.warning
+                        } else {
+                            app.icons.normal
+                        }
+                    })
+                })
+                .unwrap_or(null_mut())
+        });
         let value = wide(tip);
         for (target, source) in info.szTip.iter_mut().take(127).zip(value) {
             *target = source;
@@ -667,13 +730,20 @@ pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
         }
         SetProcessDPIAware();
         let instance = GetModuleHandleW(null());
+        let icons = match Icons::load(instance) {
+            Ok(icons) => icons,
+            Err(error) => {
+                CloseHandle(mutex);
+                return Err(error);
+            }
+        };
         let class_name = wide(CLASS);
         let mut class: WNDCLASSW = zeroed();
         class.lpfnWndProc = Some(window_proc);
         class.hInstance = instance;
         class.lpszClassName = class_name.as_ptr();
         class.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
-        class.hIcon = LoadIconW(null_mut(), IDI_INFORMATION);
+        class.hIcon = icons.big;
         if RegisterClassW(&class) == 0 {
             CloseHandle(mutex);
             return Err("Window registration failed".into());
@@ -713,6 +783,7 @@ pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
         let worker = Worker::start(monitor_only);
         APP.with(|cell| {
             *cell.borrow_mut() = Some(App {
+                icons,
                 shared: worker.shared.clone(),
                 controls: worker.controls.clone(),
                 font: font(19),
