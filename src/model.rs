@@ -51,6 +51,10 @@ pub struct State {
     pub samples: u64,
     pub log_path: PathBuf,
     pub log_error: Option<String>,
+    pub protection_status: String,
+    pub control_detail: String,
+    pub control_readiness: String,
+    pub monitor_only: bool,
 }
 impl State {
     pub fn new(log_path: PathBuf) -> Self {
@@ -63,6 +67,10 @@ impl State {
             samples: 0,
             log_path,
             log_error: None,
+            protection_status: "Protection OFF · arm manually from the tray menu".into(),
+            control_detail: "Checking GPU control availability…".into(),
+            control_readiness: "Checking GPU control availability…".into(),
+            monitor_only: false,
         }
     }
     pub fn record(&mut self, reading: Reading, now: Instant) {

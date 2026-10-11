@@ -16,9 +16,10 @@ extended from [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-
 - Rotates JSONL at 5 MiB and retains three older files (`readings.1.jsonl` through `.3.jsonl`).
 - Repairs an incomplete final record on startup. Existing CSV history is preserved.
 - Allows only one GUI instance per Windows session.
+- Provides manually armed GPU limiting and Windows power-off protection using the Python guard's default ladder.
 
-**This version is monitoring only. It does not change clocks, voltage, power limits,
-or fan speeds, and does not shut Windows down.** Current readings are not connector
+**Every launch starts disarmed.** Until you explicitly arm protection, the app reads
+sensors without changing the GPU or shutting Windows down. Current readings are not connector
 temperature measurements or a guarantee against connector damage.
 
 ## Using the app
@@ -26,9 +27,74 @@ temperature measurements or a guarantee against connector damage.
 Launch `AstralPowerMonitor.exe` (the release build is named `astral_power_monitoring.exe`).
 Closing the window hides it while monitoring continues. Click the tray icon to show it.
 Right-click the tray icon or the readings window for Show readings, Open JSONL history,
-Reset session peaks, and Quit. Launching it again restores the existing window.
+Reset session peaks, Arm protection, Disarm / Cancel, Restore saved GPU settings, and Quit.
+Launching it again restores the existing window.
 
 Use `--tray` to start with the window hidden. No autostart task is installed automatically.
+Use `--monitor-only` to prohibit arming for the entire session; launching with this flag
+also disarms an existing instance when Windows permits messaging that instance.
+
+## Protection (manual arming)
+
+Run as administrator to permit NVIDIA clock/power changes, then choose **Arm protection
+for this session** and confirm. Arming is never saved, enabled by a command-line flag,
+or enabled automatically after a restart. Ordinary monitoring needs no administrator access.
+
+The highest current across all six valid pins drives the original Python defaults:
+
+| Trigger | First response | Power-off escalation |
+| --- | --- | --- |
+| At least 9.5 A for 15 s | Lock GPU clocks low and set the driver-reported minimum power limit | Current remains at least 9.5 A after 10 s |
+| At least 13 A for 3 s | Same GPU limiting | Current remains at least 9.5 A after 5 s |
+| At least 16 A on two consecutive readings | Attempt GPU limiting | Request power-off immediately |
+
+The grace period belongs to the first mitigation; later crossings do not restart it,
+matching Python. A successful clock lock or power-cap change counts as mitigation,
+even if the other change fails. If both fail or NVML cannot control the matching card,
+the triggering tier requests power-off directly, also matching Python. Driver write
+permissions cannot be proved with the read-only readiness check: a non-elevated session
+may fall back to power-off at the trigger instead of limiting first.
+
+On this 5090, the driver reports a 400 W minimum. Clocks use the lowest enumerated
+graphics frequency, falling back to 500, 700, then 1000 MHz if necessary. The previous
+power cap is saved; restoration does not assume 600 W. The app resets its GPU clock
+lock on restoration rather than preserving a pre-existing manual clock lock. Avoid
+having another utility change these settings while protection is engaged.
+
+Limits remain for at least 120 s and are automatically restored only after 60 s of
+readings strictly below 9.3 A and a cleared grace period. A tier that re-triggers within
+600 s of that automatic release attempts limiting and requests power-off directly.
+Tier 1 uses the Python 0.2 A hysteresis and one-second clear window. Read failures
+or gaps longer than five seconds reset observation timers without releasing an
+existing GPU limit; missing readings never satisfy the clean-release window.
+
+Power-off invokes System32 `shutdown.exe /s /t 5 /f`, **not restart**. It forces apps
+closed after five seconds, which can discard unsaved work. A rejected request is
+logged while sampling continues; the next qualifying sample retries. An accepted
+request is latched to avoid repeated requests during its countdown.
+
+**Escape hatches:**
+
+- **Disarm / Cancel pending power-off** disables actions immediately and attempts to
+  abort this app's pending countdown independently of the sensor thread. Cancellation
+  can only work before the five-second countdown expires. Emergency GPU limits stay
+  in place until you choose **Restore saved GPU settings (disarms)**.
+- **Quit** disarms and attempts to cancel a pending app shutdown. Closing the window
+  only hides it. Quitting deliberately retains emergency GPU limits for later restoration.
+- `AstralPowerMonitor.exe --cancel-shutdown` directly aborts a pending Windows shutdown
+  even if the GUI is hung. This aborts any Windows shutdown countdown, not just this app's.
+  Windows may require an elevated terminal to abort an elevated request.
+- `--monitor-only` disables arming; when targeting an already elevated instance, run
+  it with matching privileges or use that instance's tray menu. If Windows blocks the
+  message, the launch reports failure instead of claiming the existing app is disarmed.
+
+Recovery intent and the original cap are flushed to
+`%LOCALAPPDATA%\AstralPowerMonitor\mitigation.json` before driver writes. After a crash,
+the app remains disarmed and requires manual restoration before arming again. Failed
+restoration retains the marker for retry; successful individual changes are tracked so
+retries only restore remaining changes. GPU UUID and power bounds are checked before
+restoring. `last_shutdown.json` retains the last protective shutdown request and reason.
+Neither recovery file causes automatic arming or automatic GPU writes on startup.
 
 For a bounded console snapshot in PowerShell:
 
@@ -40,7 +106,8 @@ For a bounded console snapshot in PowerShell:
 ## Build and validate
 
 Requires x64 Windows 10/11, Rust 1.88 or later, the MSVC toolchain/Windows SDK,
-and an installed NVIDIA driver. Python, HWiNFO, and administrator access are not required.
+and an installed NVIDIA driver. Python and HWiNFO are not required. Administrator access
+is needed for GPU limiting, not read-only monitoring.
 
 ```powershell
 cargo test --locked
@@ -49,16 +116,24 @@ cargo build --release --locked
 ```
 
 The native interface uses Windows controls and GDI. The compiled executable is roughly
-300 KiB. Sensor access uses NVIDIA's installed NVAPI driver library.
+580 KiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
+NVML loaded exclusively from System32. Control selection requires one unambiguous match
+to the monitored card's subsystem ID, with UUID checks for saved-state restoration.
 
 The tests do not access GPU hardware. They cover pin ordering and units, malformed packets,
 high-current readings, stale/disconnected state, card selection, the native request layout,
-and JSONL writing/rotation/tail recovery. Live hardware validation is a separate `--once` check.
+JSONL writing/rotation/tail recovery, every protection tier, grace periods, release/re-trigger,
+failed actions, recovery markers, and disarm/cancel races. Protection tests use fake actions
+and never shut down Windows or change the real GPU. Live hardware validation is a separate
+`--once` check; `--check-control` queries NVML without changing settings. Actual driver
+writes and Windows shutdown have not been exercised on the live machine during development.
 
 Each JSONL line is a JSON object with `schema_version`, `unix_time_ms`, and `type`.
 Sample records also contain `gpu`, a six-element `pins` array (`pin`, `volts`, `amps`,
 `watts`), and `connector_watts`. Event types are `startup`, `sensor_connected`, and
-`sensor_unavailable`. Repeated identical sensor errors are not logged on every retry.
+`sensor_unavailable`, and `protection`. Protection events include an `action` and, where
+applicable, `detail` and `max_pin_amps`. Repeated identical sensor errors are not logged
+on every retry.
 
 ## Sensor protocol and supported cards
 

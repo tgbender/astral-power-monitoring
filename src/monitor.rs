@@ -11,6 +11,7 @@ use nvapi_sys::types::NVAPI_MAX_PHYSICAL_GPUS;
 pub struct AstralPowerMonitor {
     handle: NvPhysicalGpuHandle,
     pub name: &'static str,
+    pub subsystem: u32,
 }
 pub fn model_for_id(id: u32) -> Option<&'static str> {
     Some(match id {
@@ -63,7 +64,11 @@ impl AstralPowerMonitor {
             if status == NVAPI_OK
                 && let Some(name) = model_for_id(subsystem)
             {
-                return Ok(Self { handle, name });
+                return Ok(Self {
+                    handle,
+                    name,
+                    subsystem,
+                });
             }
         }
         Err("No supported ASUS Astral sensor-equipped GPU found".into())

@@ -1,13 +1,58 @@
+use crate::actions::{Gate, RealActions};
+use crate::protection::Protection;
 use crate::{model::State, monitor::AstralPowerMonitor};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub type Shared = Arc<Mutex<State>>;
 pub struct Worker {
     pub shared: Shared,
+    pub controls: Controls,
     _stop: mpsc::Sender<()>,
+}
+#[derive(Clone)]
+pub struct Controls {
+    pub gate: Arc<Gate>,
+    sender: mpsc::Sender<Control>,
+}
+enum Control {
+    Arm(u64),
+    Disarm,
+    Restore,
+    CancelFailed(String),
+}
+impl Controls {
+    pub fn arm(&self) {
+        let _ = self
+            .sender
+            .send(Control::Arm(self.gate.epoch.load(Ordering::SeqCst)));
+    }
+    pub fn disarm(&self) {
+        self.gate.prevent_actions();
+        let _ = self.sender.send(Control::Disarm);
+    }
+    pub fn restore(&self) {
+        self.disarm();
+        let gate = self.gate.clone();
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let command = match gate.disarm_and_cancel() {
+                Ok(()) => Control::Restore,
+                Err(e) => Control::CancelFailed(e),
+            };
+            let _ = sender.send(command);
+        });
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.controls.gate.prevent_actions();
+        // Cancellation must finish before the process exits, not on a detached task.
+        let _ = self.controls.gate.disarm_and_cancel();
+    }
 }
 pub fn log_path() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -171,10 +216,17 @@ fn log_record(log: &mut Option<JsonlLog>, output: &Shared, record: serde_json::V
     }
 }
 impl Worker {
-    pub fn start() -> Self {
+    pub fn start(monitor_only: bool) -> Self {
         let shared = Arc::new(Mutex::new(State::new(log_path())));
+        shared.lock().unwrap().monitor_only = monitor_only;
         let output = shared.clone();
         let (stop, stopped) = mpsc::channel::<()>();
+        let gate = Arc::new(Gate::default());
+        let (sender, commands) = mpsc::channel::<Control>();
+        let controls = Controls {
+            gate: gate.clone(),
+            sender,
+        };
         std::thread::spawn(move || {
             let mut log = match JsonlLog::open(&log_path()) {
                 Ok(log) => Some(log),
@@ -187,16 +239,103 @@ impl Worker {
             log_record(
                 &mut log,
                 &output,
-                serde_json::json!({"type": "startup", "app_version": env!("CARGO_PKG_VERSION")}),
+                serde_json::json!({"type": "startup", "app_version": env!("CARGO_PKG_VERSION"),"protection_armed":false,"monitor_only":monitor_only}),
             );
+            let mut protection = Protection::default();
+            let folder = log_path().parent().unwrap().to_path_buf();
+            let marker = folder.join("mitigation.json");
+            let mut actions: Option<RealActions> = None;
+            if marker.exists() {
+                output
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .control_detail =
+                    "Previous emergency GPU limits may remain · use Restore saved GPU settings"
+                        .into();
+            }
             let mut reader: Option<AstralPowerMonitor> = None;
             let mut logged = Instant::now() - Duration::from_secs(2);
             let mut connected = false;
             let mut last_sensor_error: Option<String> = None;
             loop {
+                while let Ok(command) = commands.try_recv() {
+                    let event = match command {
+                        Control::Arm(epoch) => {
+                            let mut state = output.lock().unwrap_or_else(|p| p.into_inner());
+                            if epoch != gate.epoch.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if state.monitor_only
+                                || state.live_at(Instant::now()).is_none()
+                                || gate.pending()
+                                || marker.exists()
+                            {
+                                state.control_detail="Cannot arm: monitor-only, stale sensor, pending shutdown, or recovery needed".into();
+                                serde_json::json!({"type":"protection","action":"arm_rejected","detail":state.control_detail})
+                            } else {
+                                if !gate.try_arm(epoch) {
+                                    continue;
+                                }
+                                protection.disarm();
+                                state.protection_status =
+                                    "Protection ARMED · GPU limiting + power-off enabled".into();
+                                state.control_detail = state.control_readiness.clone();
+                                serde_json::json!({"type":"protection","action":"armed","detail":state.control_detail})
+                            }
+                        }
+                        Control::Disarm => {
+                            protection.disarm();
+                            let mut state = output.lock().unwrap_or_else(|p| p.into_inner());
+                            state.protection_status =
+                                "Protection OFF · emergency GPU limits kept until Restore".into();
+                            serde_json::json!({"type":"protection","action":"disarmed"})
+                        }
+                        Control::Restore => {
+                            let result = if gate.pending() {
+                                Err("Shutdown cancellation must succeed before restoration".into())
+                            } else {
+                                actions
+                                    .as_mut()
+                                    .ok_or_else(|| "GPU controls not connected".into())
+                                    .and_then(|a| protection.manual_restore(a))
+                            };
+                            let mut state = output.lock().unwrap_or_else(|p| p.into_inner());
+                            state.control_detail = match &result {
+                                Ok(()) => {
+                                    "Saved power limit restored; app clock locks removed".into()
+                                }
+                                Err(e) => format!("Restore failed: {e}"),
+                            };
+                            serde_json::json!({"type":"protection","action":if result.is_ok(){"manual_restore"}else{"restore_failed"},"detail":state.control_detail})
+                        }
+                        Control::CancelFailed(error) => {
+                            output
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .control_detail =
+                                format!("Shutdown cancellation failed; settings kept: {error}");
+                            serde_json::json!({"type":"protection","action":"cancel_failed","detail":error})
+                        }
+                    };
+                    log_record(&mut log, &output, event);
+                }
                 let result = (|| {
                     if reader.is_none() {
                         reader = Some(AstralPowerMonitor::new()?);
+                        let monitor = reader.as_ref().unwrap();
+                        // Read-only initialization: connect to precisely the sensor's
+                        // subsystem; ambiguous multiple-card matches are rejected.
+                        actions = Some(RealActions::new(
+                            monitor.subsystem,
+                            folder.clone(),
+                            gate.clone(),
+                        ));
+                        let readiness = actions.as_ref().unwrap().readiness();
+                        let mut state = output.lock().unwrap_or_else(|p| p.into_inner());
+                        state.control_readiness = readiness.clone();
+                        if !marker.exists() {
+                            state.control_detail = readiness;
+                        }
                     }
                     let monitor = reader.as_ref().ok_or("Sensor disconnected")?;
                     monitor.read().map(|reading| (monitor.name, reading))
@@ -218,6 +357,29 @@ impl Worker {
                             state.gpu_name = name.into();
                             state.record(reading, now);
                         }
+                        if gate.armed.load(Ordering::SeqCst)
+                            && let Some(actions) = actions.as_mut()
+                        {
+                            for event in protection.tick(now, reading.max_amps(), actions) {
+                                {
+                                    let mut state =
+                                        output.lock().unwrap_or_else(|p| p.into_inner());
+                                    state.control_detail = event.detail.clone();
+                                    state.protection_status = if protection.shutdown_pending {
+                                        "POWER-OFF requested · 5 s countdown · Disarm/Cancel to abort".into()
+                                    } else if protection.limited() {
+                                        "Protection ARMED · emergency GPU limits active".into()
+                                    } else {
+                                        "Protection ARMED · GPU limiting + power-off enabled".into()
+                                    };
+                                }
+                                log_record(
+                                    &mut log,
+                                    &output,
+                                    serde_json::json!({"type":"protection","action":event.action,"detail":event.detail,"max_pin_amps":reading.max_amps()}),
+                                );
+                            }
+                        }
                         if now.duration_since(logged) >= Duration::from_secs(1) {
                             logged = now;
                             if let Some(log) = &mut log {
@@ -228,6 +390,7 @@ impl Worker {
                         Duration::from_millis(500)
                     }
                     Err(error) => {
+                        protection.reset_observations();
                         if last_sensor_error.as_deref() != Some(&error) {
                             log_record(
                                 &mut log,
@@ -250,6 +413,7 @@ impl Worker {
         });
         Self {
             shared,
+            controls,
             _stop: stop,
         }
     }

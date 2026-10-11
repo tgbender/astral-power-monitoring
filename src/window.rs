@@ -1,6 +1,6 @@
 //! Native Win32 UI. Hardware reads happen only on the separate worker thread.
 use crate::model::WARNING_AMPS;
-use crate::worker::{Shared, Worker};
+use crate::worker::{Controls, Shared, Worker};
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -17,10 +17,15 @@ const SHOW: usize = 100;
 const LOGS: usize = 101;
 const RESET: usize = 102;
 const QUIT: usize = 103;
+const ARM: usize = 104;
+const DISARM: usize = 105;
+const RESTORE: usize = 106;
+const MONITOR_ONLY: u32 = WM_APP + 2;
 const CLASS: &str = "AstralPowerMonitorRustWindow";
 
 struct App {
     shared: Shared,
+    controls: Controls,
     font: HFONT,
     small_font: HFONT,
     big_font: HFONT,
@@ -121,6 +126,7 @@ unsafe fn show(hwnd: HWND) {
 
 unsafe fn popup(hwnd: HWND, app: &App) {
     unsafe {
+        update_menu(app);
         let mut point: POINT = zeroed();
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);
@@ -136,6 +142,43 @@ unsafe fn popup(hwnd: HWND, app: &App) {
         PostMessageW(hwnd, WM_COMMAND, command as usize, 0);
         PostMessageW(hwnd, WM_NULL, 0, 0);
     }
+}
+unsafe fn update_menu(app: &App) {
+    let state = app.shared.lock().unwrap_or_else(|p| p.into_inner());
+    let disabled = state.monitor_only
+        || state.live_at(Instant::now()).is_none()
+        || app.controls.gate.pending()
+        || app
+            .controls
+            .gate
+            .armed
+            .load(std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        EnableMenuItem(
+            app.menu,
+            ARM as u32,
+            MF_BYCOMMAND | if disabled { MF_GRAYED } else { MF_ENABLED },
+        );
+    }
+}
+
+fn disarm(app: &App) {
+    app.controls.disarm();
+    let gate = app.controls.gate.clone();
+    let shared = app.shared.clone();
+    shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .protection_status = "Protection OFF · cancelling any pending power-off…".into();
+    // Cancellation must work even if the sampling thread is stuck in the driver.
+    std::thread::spawn(move || {
+        let result = gate.disarm_and_cancel();
+        let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        state.control_detail=match result {
+            Ok(())=>"Disarmed; pending power-off cancelled if present. GPU limits retained until Restore.".into(),
+            Err(e)=>format!("Disarmed, but cancellation failed: {e}"),
+        };
+    });
 }
 
 unsafe fn paint(hwnd: HWND, app: &App) {
@@ -269,7 +312,25 @@ unsafe fn paint(hwnd: HWND, app: &App) {
             28,
             470,
             650,
-            "Monitoring only · automatic protection is not enabled",
+            &state.protection_status,
+            if app
+                .controls
+                .gate
+                .armed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                amber
+            } else {
+                muted
+            },
+            app.small_font,
+        );
+        text(
+            dc,
+            28,
+            495,
+            650,
+            &state.control_detail,
             muted,
             app.small_font,
         );
@@ -283,7 +344,7 @@ unsafe fn paint(hwnd: HWND, app: &App) {
         text(
             dc,
             28,
-            495,
+            528,
             650,
             &log_status,
             if state.log_error.is_some() {
@@ -296,7 +357,7 @@ unsafe fn paint(hwnd: HWND, app: &App) {
         text(
             dc,
             28,
-            528,
+            555,
             650,
             "Close hides this window · right-click the tray icon to show it or quit",
             muted,
@@ -335,13 +396,37 @@ unsafe extern "system" fn window_proc(
                         let tip = reading
                             .map(|r| {
                                 format!(
-                                    "Astral: {:.1} W · max {:.2} A · monitoring only",
+                                    "Astral: {:.1} W · max {:.2} A · {}",
                                     r.watts(),
-                                    r.max_amps()
+                                    r.max_amps(),
+                                    if app.controls.gate.pending() {
+                                        "POWER-OFF PENDING"
+                                    } else if app
+                                        .controls
+                                        .gate
+                                        .armed
+                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        "ARMED"
+                                    } else {
+                                        "protection OFF"
+                                    }
                                 )
                             })
                             .unwrap_or_else(|| {
-                                "Astral: sensor unavailable · monitoring only".into()
+                                format!(
+                                    "Astral: sensor unavailable · {}",
+                                    if app
+                                        .controls
+                                        .gate
+                                        .armed
+                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        "ARMED"
+                                    } else {
+                                        "protection OFF"
+                                    }
+                                )
                             });
                         let warning = reading.is_none_or(|r| r.max_amps() >= WARNING_AMPS);
                         if !notify(hwnd, NIM_MODIFY, &tip, warning) {
@@ -379,6 +464,7 @@ unsafe extern "system" fn window_proc(
                             if let Ok(app) = cell.try_borrow()
                                 && let Some(app) = app.as_ref()
                             {
+                                update_menu(app);
                                 let mut point: POINT = zeroed();
                                 GetCursorPos(&mut point);
                                 SetForegroundWindow(hwnd);
@@ -404,7 +490,39 @@ unsafe extern "system" fn window_proc(
                 match wparam & 0xffff {
                     SHOW => show(hwnd),
                     QUIT => {
+                        APP.with(|cell| {
+                            if let Some(app) = cell.borrow().as_ref() {
+                                app.controls.disarm();
+                            }
+                        });
                         DestroyWindow(hwnd);
+                    }
+                    ARM => {
+                        APP.with(|cell| {
+                            if let Some(app)=cell.borrow().as_ref() {
+                                let monitor_only=app.shared.lock().unwrap_or_else(|p|p.into_inner()).monitor_only;
+                                if monitor_only {
+                                    MessageBoxW(hwnd,wide("This session was launched with --monitor-only. Restart normally to enable manual arming.").as_ptr(),wide("Monitor only").as_ptr(),MB_OK|MB_ICONINFORMATION);
+                                } else if MessageBoxW(hwnd,wide("Enable real protection for this session?\n\n9.5 A for 15 s: limit GPU; 10 s grace.\n13 A for 3 s: limit GPU; 5 s grace.\n16 A on two samples: limit GPU and power off.\n\nIf limiting is unavailable or both changes fail, a trigger powers off directly. Power-off forces apps closed after 5 s; unsaved work can be lost.\n\nDisarm / Cancel aborts a pending countdown and keeps emergency GPU limits. The app starts disarmed next time.").as_ptr(),wide("Arm GPU protection").as_ptr(),MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)==IDYES {
+                                    app.controls.arm();
+                                }
+                            }
+                        });
+                    }
+                    DISARM => {
+                        APP.with(|cell| {
+                            if let Some(app) = cell.borrow().as_ref() {
+                                disarm(app);
+                            }
+                        });
+                    }
+                    RESTORE => {
+                        APP.with(|cell| {
+                            if let Some(app) = cell.borrow().as_ref() {
+                                disarm(app);
+                                app.controls.restore();
+                            }
+                        });
                     }
                     LOGS => {
                         APP.with(|cell| {
@@ -440,6 +558,18 @@ unsafe extern "system" fn window_proc(
                 0
             }
             _ => {
+                if msg == MONITOR_ONLY {
+                    APP.with(|cell| {
+                        if let Some(app) = cell.borrow().as_ref() {
+                            app.shared
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .monitor_only = true;
+                            disarm(app);
+                        }
+                    });
+                    return 0;
+                }
                 let recreated = APP.with(|cell| {
                     cell.try_borrow()
                         .ok()
@@ -457,7 +587,7 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-pub fn run(start_hidden: bool) -> Result<(), String> {
+pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
     unsafe {
         let mutex = CreateMutexW(null(), 0, wide("Local\\AstralPowerMonitorRust").as_ptr());
         if mutex.is_null() {
@@ -469,6 +599,10 @@ pub fn run(start_hidden: bool) -> Result<(), String> {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let existing = FindWindowW(wide(CLASS).as_ptr(), null());
             if !existing.is_null() {
+                if monitor_only && PostMessageW(existing, MONITOR_ONLY, 0, 0) == 0 {
+                    CloseHandle(mutex);
+                    return Err("Cannot disarm the existing instance; use its tray menu or launch --monitor-only with matching administrator privileges".into());
+                }
                 show(existing);
             }
             CloseHandle(mutex);
@@ -495,7 +629,7 @@ pub fn run(start_hidden: bool) -> Result<(), String> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             730,
-            640,
+            675,
             null_mut(),
             null_mut(),
             instance,
@@ -510,14 +644,18 @@ pub fn run(start_hidden: bool) -> Result<(), String> {
             (SHOW, "Show readings"),
             (LOGS, "Open JSONL history"),
             (RESET, "Reset session peaks"),
+            (ARM, "Arm protection for this session…"),
+            (DISARM, "Disarm / Cancel pending power-off"),
+            (RESTORE, "Restore saved GPU settings (disarms)"),
             (QUIT, "Quit"),
         ] {
             AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr());
         }
-        let worker = Worker::start();
+        let worker = Worker::start(monitor_only);
         APP.with(|cell| {
             *cell.borrow_mut() = Some(App {
                 shared: worker.shared.clone(),
+                controls: worker.controls.clone(),
                 font: font(19),
                 small_font: font(15),
                 big_font: font(25),
