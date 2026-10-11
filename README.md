@@ -11,8 +11,10 @@ extended from [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-
 - Marks readings unavailable after a read failure or three seconds without a fresh sample.
 - Reconnects every five seconds after sensor/driver failures.
 - Displays a warning at 9.2 A; this is a display warning, not an automatic intervention.
-- Saves a CSV sample about once per second to `%LOCALAPPDATA%\AstralPowerMonitor\readings.csv`.
-- Rotates the CSV at 5 MiB and retains three older files.
+- Saves a JSONL sample about once per second to `%LOCALAPPDATA%\AstralPowerMonitor\readings.jsonl`.
+- Records startup and sensor connection/unavailability events alongside samples.
+- Rotates JSONL at 5 MiB and retains three older files (`readings.1.jsonl` through `.3.jsonl`).
+- Repairs an incomplete final record on startup. Existing CSV history is preserved.
 - Allows only one GUI instance per Windows session.
 
 **This version is monitoring only. It does not change clocks, voltage, power limits,
@@ -23,7 +25,7 @@ temperature measurements or a guarantee against connector damage.
 
 Launch `AstralPowerMonitor.exe` (the release build is named `astral_power_monitoring.exe`).
 Closing the window hides it while monitoring continues. Click the tray icon to show it.
-Right-click the tray icon or the readings window for Show readings, Open CSV history,
+Right-click the tray icon or the readings window for Show readings, Open JSONL history,
 Reset session peaks, and Quit. Launching it again restores the existing window.
 
 Use `--tray` to start with the window hidden. No autostart task is installed automatically.
@@ -51,7 +53,12 @@ The native interface uses Windows controls and GDI. The compiled executable is r
 
 The tests do not access GPU hardware. They cover pin ordering and units, malformed packets,
 high-current readings, stale/disconnected state, card selection, the native request layout,
-and CSV writing/rotation. Live hardware validation is a separate `--once` check.
+and JSONL writing/rotation/tail recovery. Live hardware validation is a separate `--once` check.
+
+Each JSONL line is a JSON object with `schema_version`, `unix_time_ms`, and `type`.
+Sample records also contain `gpu`, a six-element `pins` array (`pin`, `volts`, `amps`,
+`watts`), and `connector_watts`. Event types are `startup`, `sensor_connected`, and
+`sensor_unavailable`. Repeated identical sensor errors are not logged on every retry.
 
 ## Sensor protocol and supported cards
 

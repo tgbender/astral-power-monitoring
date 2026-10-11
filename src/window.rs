@@ -276,8 +276,10 @@ unsafe fn paint(hwnd: HWND, app: &App) {
         let log_status = state
             .log_error
             .as_ref()
-            .map(|e| format!("CSV logging unavailable: {e}"))
-            .unwrap_or_else(|| "CSV history is saved locally · open it from the tray menu".into());
+            .map(|e| format!("JSONL logging unavailable: {e}"))
+            .unwrap_or_else(|| {
+                "JSONL history is saved locally · open it from the tray menu".into()
+            });
         text(
             dc,
             28,
@@ -506,7 +508,7 @@ pub fn run(start_hidden: bool) -> Result<(), String> {
         let menu = CreatePopupMenu();
         for (id, label) in [
             (SHOW, "Show readings"),
-            (LOGS, "Open CSV history"),
+            (LOGS, "Open JSONL history"),
             (RESET, "Reset session peaks"),
             (QUIT, "Quit"),
         ] {
