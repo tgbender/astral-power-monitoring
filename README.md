@@ -20,6 +20,7 @@ extended from [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-
 - Uses a teal GPU tray/taskbar icon with six gold contacts; warnings use an amber exclamation version.
 - Provides manually armed GPU limiting and Windows power-off protection using the Python guard's default ladder.
 - Plays embedded audio warnings even while protection is disarmed. Audio playback runs separately from sensor reads and protective actions.
+- An independent freshness watchdog sounds once if valid pin readings stop, and confirms stable recovery.
 
 **Every launch starts disarmed.** Until you explicitly arm protection, the app reads
 sensors without changing the GPU or shutting Windows down. Current readings are not connector
@@ -32,7 +33,7 @@ Closing the window hides it while monitoring continues. Click the tray icon to s
 Right-click the tray icon or the readings window for Show readings, Open SQLite history folder,
 Flush buffered history now,
 Reset session peaks, Arm protection, Disarm / Cancel, Restore saved GPU settings,
-Test all four sounds, Mute warning chime, and Quit.
+Test all sounds, Test monitoring-loss / recovery sounds, Mute warning chime, and Quit.
 Launching it again restores the existing window.
 
 Use `--tray` to start with the window hidden. Launching the executable alone does not
@@ -59,10 +60,35 @@ Higher-priority alerts interrupt lower-priority sounds; intervention waits for a
 critical tone, while a shutdown alarm supersedes both. Nothing beeps every sensor poll.
 
 **Mute warning chime** only mutes the early 9.5 A chime. Critical, intervention, and
-shutdown tones remain audible. Mute is not saved across app launches. **Test all four
+shutdown tones remain audible, as do monitoring-loss and recovery tones. Mute is not saved across app launches. **Test all
 sounds** plays one preview of each and never arms protection, changes GPU settings,
 or schedules a shutdown. Test audio cannot replace an active real alert. Windows volume
 and the selected output device still determine whether any sound can be heard.
+
+### Monitoring loss
+
+A separate watchdog checks a tiny in-memory sensor heartbeat twice per second; it
+does not issue additional GPU reads and does not depend on the sensor worker or GUI
+making progress. After at least one valid sample, no fresh valid reading for more
+than three seconds triggers a low descending triple tone, once per outage. The
+initial connection has a ten-second grace period so ordinary startup remains quiet.
+
+Recovery requires at least one second of healthy freshness and additional successful
+readings; a single good sample followed by another failure cannot announce recovery.
+A short ascending confirmation sounds on recovery, and a later outage can alert again.
+SQLite `monitoring` events record `lost`/`recovered`, sample count, and last-sample age.
+Existing sensor-error events continue to record the underlying driver/read failures.
+
+Missing data only alerts: the watchdog never changes GPU settings or requests Windows
+shutdown, and an existing emergency limit remains governed by the protection engine.
+The shutdown countdown and critical-current sounds have priority over monitoring sounds.
+Normal application exit stops the watchdog before closing audio/history.
+
+The **Test monitoring-loss / recovery sounds** menu item, or
+`AstralPowerMonitor.exe --test-monitoring-alerts`, previews both sounds in the running
+app without pausing sampling, manufacturing an outage, or invoking protective actions.
+The watchdog runs inside this process: it cannot alert if the entire app exits/crashes,
+Windows freezes completely, or the audio output is unavailable.
 
 ## Start at Windows login
 
@@ -171,7 +197,8 @@ high-current readings, stale/disconnected state, card selection, the native requ
 SQLite batching, retention, legacy import, transactional failure/retry, bounded logging queues,
 every protection tier, grace periods, release/re-trigger,
 failed actions, recovery markers, disarm/cancel races, audio thresholds, priority,
-muting, countdown cancellation, and playback failures. Protection/audio tests use fake actions
+muting, countdown cancellation, playback failures, independent monitoring-loss detection,
+startup grace, and stable recovery. Protection/audio tests use fake actions
 and never shut down Windows or change the real GPU. Live hardware validation is a separate
 `--once` check; `--check-control` queries NVML without changing settings. Actual driver
 writes and Windows shutdown have not been exercised on the live machine during development.

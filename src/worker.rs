@@ -2,6 +2,7 @@ use crate::actions::{Gate, RealActions};
 use crate::audio::{Audio, Detector, Tone};
 use crate::history::History;
 use crate::protection::Protection;
+use crate::watchdog::{Heartbeat, Watchdog};
 use crate::{model::State, monitor::AstralPowerMonitor};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -13,6 +14,7 @@ pub struct Worker {
     pub controls: Controls,
     stop: mpsc::Sender<()>,
     finished: mpsc::Receiver<()>,
+    watchdog: Watchdog,
 }
 #[derive(Clone)]
 pub struct Controls {
@@ -54,6 +56,7 @@ impl Controls {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.controls.gate.prevent_actions();
+        self.watchdog.stop();
         let _ = self.controls.gate.disarm_and_cancel();
         self.controls.audio.quit();
         let _ = self.stop.send(());
@@ -85,6 +88,8 @@ impl Worker {
         };
         let audio = controls.audio.clone();
         let log = controls.history.clone();
+        let heartbeat = Arc::new(Heartbeat::default());
+        let watchdog = Watchdog::start(heartbeat.clone(), audio.clone(), log.clone());
         std::thread::spawn(move || {
             log_record(
                 &log,
@@ -192,6 +197,7 @@ impl Worker {
                 let wait = match result {
                     Ok((name, reading)) => {
                         let now = Instant::now();
+                        heartbeat.record(now);
                         if !connected {
                             log_record(
                                 &log,
@@ -251,6 +257,7 @@ impl Worker {
                         Duration::from_millis(500)
                     }
                     Err(error) => {
+                        heartbeat.failed();
                         protection.reset_observations();
                         detector.unavailable();
                         if last_sensor_error.as_deref() != Some(&error) {
@@ -280,6 +287,7 @@ impl Worker {
             controls,
             stop,
             finished,
+            watchdog,
         }
     }
 }

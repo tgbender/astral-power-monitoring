@@ -78,6 +78,24 @@ fn main() {
     silence(&mut limited, 0.08);
     save(folder, "limited.wav", &limited);
 
+    // Monitoring is blind: a slower, lower descending triple, distinct from limiting.
+    let mut lost = Vec::new();
+    tone(&mut lost, 660.0, 0.18);
+    silence(&mut lost, 0.08);
+    tone(&mut lost, 440.0, 0.18);
+    silence(&mut lost, 0.08);
+    tone(&mut lost, 330.0, 0.26);
+    silence(&mut lost, 0.12);
+    save(folder, "monitoring-lost.wav", &lost);
+
+    // Short confirmation only after the watchdog verifies stable fresh readings.
+    let mut recovered = Vec::new();
+    tone(&mut recovered, 440.0, 0.09);
+    silence(&mut recovered, 0.07);
+    tone(&mut recovered, 660.0, 0.12);
+    silence(&mut recovered, 0.08);
+    save(folder, "monitoring-recovered.wav", &recovered);
+
     // One second of alternating tones, suitable for a countdown loop.
     let mut shutdown = Vec::new();
     for _ in 0..2 {

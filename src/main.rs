@@ -5,11 +5,20 @@ mod history;
 mod model;
 mod monitor;
 mod protection;
+mod watchdog;
 mod window;
 mod worker;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "--quit") {
+    if args
+        .first()
+        .is_some_and(|a| a == "--test-monitoring-alerts")
+    {
+        if let Err(error) = window::request_test_monitoring() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    } else if args.first().is_some_and(|a| a == "--quit") {
         if let Err(error) = window::request_exit() {
             eprintln!("{error}");
             std::process::exit(1);
@@ -57,7 +66,7 @@ fn main() {
         }
     } else if args.first().is_some_and(|a| a == "--help") {
         println!(
-            "GUI starts disarmed; arm manually from the tray. --tray hides the window; --monitor-only disables arming; --once/--samples N reads sensors; --check-control checks NVML without writes; --cancel-shutdown aborts a pending Windows shutdown; --quit gracefully stops the running app and flushes history."
+            "GUI starts disarmed; arm manually from the tray. --tray hides the window; --monitor-only disables arming; --once/--samples N reads sensors; --check-control checks NVML without writes; --cancel-shutdown aborts a pending Windows shutdown; --quit gracefully stops the running app and flushes history; --test-monitoring-alerts previews monitoring-loss/recovery sounds in the running app."
         );
     } else if let Err(error) = window::run(
         args.iter().any(|a| a == "--tray"),

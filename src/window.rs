@@ -23,6 +23,7 @@ const RESTORE: usize = 106;
 const TEST_SOUNDS: usize = 107;
 const MUTE_WARNING: usize = 108;
 const FLUSH_HISTORY: usize = 109;
+const TEST_MONITORING: usize = 110;
 const MONITOR_ONLY: u32 = WM_APP + 2;
 const CLASS: &str = "AstralPowerMonitorRustWindow";
 
@@ -464,7 +465,7 @@ unsafe fn paint(hwnd: HWND, app: &App) {
                         .warning_muted
                         .load(std::sync::atomic::Ordering::SeqCst)
                     {
-                        "Warning chime muted · critical / power-off alerts still sound".into()
+                        "Warning chime muted · monitoring / critical alerts still sound".into()
                     } else {
                         "Audio alerts ON · warnings work while protection is OFF".into()
                     }
@@ -667,6 +668,13 @@ unsafe extern "system" fn window_proc(
                             }
                         });
                     }
+                    TEST_MONITORING => {
+                        APP.with(|cell| {
+                            if let Some(app) = cell.borrow().as_ref() {
+                                app.controls.audio.test_monitoring();
+                            }
+                        });
+                    }
                     MUTE_WARNING => {
                         APP.with(|cell| {
                             if let Some(app) = cell.borrow().as_ref() {
@@ -756,6 +764,21 @@ pub fn request_exit() -> Result<(), String> {
     }
     Ok(())
 }
+pub fn request_test_monitoring() -> Result<(), String> {
+    unsafe {
+        let window = FindWindowW(wide(CLASS).as_ptr(), null());
+        if window.is_null() {
+            return Err("Monitor is not running".into());
+        }
+        if PostMessageW(window, WM_COMMAND, TEST_MONITORING, 0) == 0 {
+            return Err(
+                "Cannot request sound test; matching administrator privileges may be required"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
 pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
     unsafe {
         let mutex = CreateMutexW(null(), 0, wide("Local\\AstralPowerMonitorRust").as_ptr());
@@ -824,7 +847,8 @@ pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
             (ARM, "Arm protection for this session…"),
             (DISARM, "Disarm / Cancel pending power-off"),
             (RESTORE, "Restore saved GPU settings (disarms)"),
-            (TEST_SOUNDS, "Test all four sounds (no protection actions)"),
+            (TEST_SOUNDS, "Test all sounds (no protection actions)"),
+            (TEST_MONITORING, "Test monitoring-loss / recovery sounds"),
             (MUTE_WARNING, "Mute warning chime (critical still sounds)"),
             (QUIT, "Quit"),
         ] {

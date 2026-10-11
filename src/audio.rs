@@ -9,25 +9,31 @@ use windows_sys::Win32::Media::Audio::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tone {
+    Recovered,
     Warning,
     Limited,
+    MonitoringLost,
     Critical,
     Shutdown,
 }
 impl Tone {
     fn duration(self) -> Duration {
         Duration::from_millis(match self {
+            Self::Recovered => 360,
             Self::Warning => 440,
             Self::Limited => 540,
             Self::Critical => 660,
+            Self::MonitoringLost => 900,
             Self::Shutdown => 1000,
         })
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::Recovered => "monitoring_recovered",
             Self::Warning => "warning",
             Self::Limited => "gpu_limited",
             Self::Critical => "critical",
+            Self::MonitoringLost => "monitoring_lost",
             Self::Shutdown => "shutdown_countdown",
         }
     }
@@ -105,9 +111,15 @@ static CRITICAL: Wav<{ include_bytes!("../assets/sounds/critical.wav").len() }> 
     Wav(*include_bytes!("../assets/sounds/critical.wav"));
 static SHUTDOWN: Wav<{ include_bytes!("../assets/sounds/shutdown.wav").len() }> =
     Wav(*include_bytes!("../assets/sounds/shutdown.wav"));
+static LOST: Wav<{ include_bytes!("../assets/sounds/monitoring-lost.wav").len() }> =
+    Wav(*include_bytes!("../assets/sounds/monitoring-lost.wav"));
+static RECOVERED: Wav<{ include_bytes!("../assets/sounds/monitoring-recovered.wav").len() }> =
+    Wav(*include_bytes!("../assets/sounds/monitoring-recovered.wav"));
 impl Output for NativeOutput {
     fn play(&mut self, tone: Tone, looping: bool) -> Result<(), String> {
         let bytes: &'static [u8] = match tone {
+            Tone::Recovered => &RECOVERED.0,
+            Tone::MonitoringLost => &LOST.0,
             Tone::Warning => &WARNING.0,
             Tone::Limited => &LIMITED.0,
             Tone::Critical => &CRITICAL.0,
@@ -131,6 +143,7 @@ enum Command {
     Cue(Tone),
     CancelCountdown,
     Test,
+    TestMonitoring,
     MuteChanged,
     Quit,
 }
@@ -219,8 +232,15 @@ impl Player {
                         Tone::Warning,
                         Tone::Critical,
                         Tone::Limited,
+                        Tone::MonitoringLost,
+                        Tone::Recovered,
                         Tone::Shutdown,
                     ]);
+                }
+            }
+            Command::TestMonitoring => {
+                if self.active.is_none() && self.deferred.is_none() {
+                    self.preview = VecDeque::from([Tone::MonitoringLost, Tone::Recovered]);
                 }
             }
             Command::Quit => {
@@ -334,6 +354,10 @@ impl Audio {
     pub fn test(&self) {
         *self.error.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.send(Command::Test);
+    }
+    pub fn test_monitoring(&self) {
+        *self.error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.send(Command::TestMonitoring);
     }
     pub fn quit(&self) {
         self.countdown.store(false, Ordering::SeqCst);
@@ -449,7 +473,7 @@ mod tests {
     fn test_sequence_never_starts_a_countdown_and_real_alerts_interrupt_it() {
         let (mut p, mut o, t) = (Player::default(), Fake::default(), Instant::now());
         p.command(t, Command::Test, false, false, &mut o).unwrap();
-        for ms in [440, 1100, 1640, 2640] {
+        for ms in [440, 1100, 1640, 2540, 2900, 3900] {
             p.advance(t + Duration::from_millis(ms), false, false, &mut o)
                 .unwrap();
         }
@@ -459,6 +483,8 @@ mod tests {
                 (Tone::Warning, false),
                 (Tone::Critical, false),
                 (Tone::Limited, false),
+                (Tone::MonitoringLost, false),
+                (Tone::Recovered, false),
                 (Tone::Shutdown, false)
             ]
         );
@@ -487,5 +513,55 @@ mod tests {
         p.command(t, Command::Cue(Tone::Critical), false, false, &mut o)
             .unwrap();
         assert!(p.active.is_some());
+    }
+    #[test]
+    fn monitoring_alerts_ignore_warning_mute_and_do_not_interrupt_shutdown() {
+        let (mut p, mut o, t) = (Player::default(), Fake::default(), Instant::now());
+        p.command(t, Command::Cue(Tone::MonitoringLost), true, false, &mut o)
+            .unwrap();
+        assert_eq!(o.played, [(Tone::MonitoringLost, false)]);
+        p.advance(t + Duration::from_millis(900), true, false, &mut o)
+            .unwrap();
+        p.command(
+            t + Duration::from_secs(1),
+            Command::Cue(Tone::Recovered),
+            true,
+            false,
+            &mut o,
+        )
+        .unwrap();
+        assert_eq!(o.played.last(), Some(&(Tone::Recovered, false)));
+        p.command(
+            t + Duration::from_secs(2),
+            Command::Cue(Tone::Shutdown),
+            true,
+            true,
+            &mut o,
+        )
+        .unwrap();
+        p.command(
+            t + Duration::from_secs(3),
+            Command::Cue(Tone::MonitoringLost),
+            true,
+            true,
+            &mut o,
+        )
+        .unwrap();
+        assert_eq!(o.played.last(), Some(&(Tone::Shutdown, true)));
+    }
+    #[test]
+    fn monitoring_sound_test_does_not_start_a_real_countdown() {
+        let (mut p, mut o, t) = (Player::default(), Fake::default(), Instant::now());
+        p.command(t, Command::TestMonitoring, true, false, &mut o)
+            .unwrap();
+        p.advance(t + Duration::from_millis(900), true, false, &mut o)
+            .unwrap();
+        p.advance(t + Duration::from_millis(1260), true, false, &mut o)
+            .unwrap();
+        assert!(p.active.is_none());
+        assert_eq!(
+            o.played,
+            [(Tone::MonitoringLost, false), (Tone::Recovered, false)]
+        );
     }
 }
