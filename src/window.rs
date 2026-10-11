@@ -20,6 +20,8 @@ const QUIT: usize = 103;
 const ARM: usize = 104;
 const DISARM: usize = 105;
 const RESTORE: usize = 106;
+const TEST_SOUNDS: usize = 107;
+const MUTE_WARNING: usize = 108;
 const MONITOR_ONLY: u32 = WM_APP + 2;
 const CLASS: &str = "AstralPowerMonitorRustWindow";
 
@@ -158,6 +160,21 @@ unsafe fn update_menu(app: &App) {
             app.menu,
             ARM as u32,
             MF_BYCOMMAND | if disabled { MF_GRAYED } else { MF_ENABLED },
+        );
+        CheckMenuItem(
+            app.menu,
+            MUTE_WARNING as u32,
+            MF_BYCOMMAND
+                | if app
+                    .controls
+                    .audio
+                    .warning_muted
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
         );
     }
 }
@@ -359,6 +376,32 @@ unsafe fn paint(hwnd: HWND, app: &App) {
             28,
             555,
             650,
+            &app.controls
+                .audio
+                .error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .unwrap_or_else(|| {
+                    if app
+                        .controls
+                        .audio
+                        .warning_muted
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        "Warning chime muted · critical / power-off alerts still sound".into()
+                    } else {
+                        "Audio alerts ON · warnings work while protection is OFF".into()
+                    }
+                }),
+            muted,
+            app.small_font,
+        );
+        text(
+            dc,
+            28,
+            582,
+            650,
             "Close hides this window · right-click the tray icon to show it or quit",
             muted,
             app.small_font,
@@ -524,6 +567,20 @@ unsafe extern "system" fn window_proc(
                             }
                         });
                     }
+                    TEST_SOUNDS => {
+                        APP.with(|cell| {
+                            if let Some(app) = cell.borrow().as_ref() {
+                                app.controls.audio.test();
+                            }
+                        });
+                    }
+                    MUTE_WARNING => {
+                        APP.with(|cell| {
+                            if let Some(app) = cell.borrow().as_ref() {
+                                app.controls.audio.toggle_warning_mute();
+                            }
+                        });
+                    }
                     LOGS => {
                         APP.with(|cell| {
                             if let Ok(app) = cell.try_borrow()
@@ -629,7 +686,7 @@ pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             730,
-            675,
+            715,
             null_mut(),
             null_mut(),
             instance,
@@ -647,6 +704,8 @@ pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
             (ARM, "Arm protection for this session…"),
             (DISARM, "Disarm / Cancel pending power-off"),
             (RESTORE, "Restore saved GPU settings (disarms)"),
+            (TEST_SOUNDS, "Test all four sounds (no protection actions)"),
+            (MUTE_WARNING, "Mute warning chime (critical still sounds)"),
             (QUIT, "Quit"),
         ] {
             AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr());

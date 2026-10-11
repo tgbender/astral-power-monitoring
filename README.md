@@ -17,6 +17,7 @@ extended from [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-
 - Repairs an incomplete final record on startup. Existing CSV history is preserved.
 - Allows only one GUI instance per Windows session.
 - Provides manually armed GPU limiting and Windows power-off protection using the Python guard's default ladder.
+- Plays embedded audio warnings even while protection is disarmed. Audio playback runs separately from sensor reads and protective actions.
 
 **Every launch starts disarmed.** Until you explicitly arm protection, the app reads
 sensors without changing the GPU or shutting Windows down. Current readings are not connector
@@ -27,12 +28,53 @@ temperature measurements or a guarantee against connector damage.
 Launch `AstralPowerMonitor.exe` (the release build is named `astral_power_monitoring.exe`).
 Closing the window hides it while monitoring continues. Click the tray icon to show it.
 Right-click the tray icon or the readings window for Show readings, Open JSONL history,
-Reset session peaks, Arm protection, Disarm / Cancel, Restore saved GPU settings, and Quit.
+Reset session peaks, Arm protection, Disarm / Cancel, Restore saved GPU settings,
+Test all four sounds, Mute warning chime, and Quit.
 Launching it again restores the existing window.
 
-Use `--tray` to start with the window hidden. No autostart task is installed automatically.
+Use `--tray` to start with the window hidden. Launching the executable alone does not
+install startup entries. The optional installation below creates a shortcut for this user.
 Use `--monitor-only` to prohibit arming for the entire session; launching with this flag
 also disarms an existing instance when Windows permits messaging that instance.
+
+## Sound alerts
+
+The original WAVs are embedded in the executable; no external sound files or Python
+runtime are needed. Playback uses asynchronous Windows audio on a dedicated thread.
+Audio errors appear in the window and never stop sampling or delay protective actions.
+
+- At least 9.5 A continuously for two seconds: ascending warning chime, once per episode.
+- At least 13 A: critical triple tone immediately, once per episode. This early sound
+  does not change the original three-second protection timer.
+- GPU limiting successfully activates: descending intervention chime.
+- Windows accepts a shutdown request: alternating countdown alarm for up to five seconds.
+  It stops when disarmed/cancelled, when the app quits, or when its timer expires.
+
+Warning episodes re-arm after fresh current below 9.3 A for one second. Sensor errors
+and gaps cannot count toward the sustained warning or clear an existing warning episode.
+Higher-priority alerts interrupt lower-priority sounds; intervention waits for a playing
+critical tone, while a shutdown alarm supersedes both. Nothing beeps every sensor poll.
+
+**Mute warning chime** only mutes the early 9.5 A chime. Critical, intervention, and
+shutdown tones remain audible. Mute is not saved across app launches. **Test all four
+sounds** plays one preview of each and never arms protection, changes GPU settings,
+or schedules a shutdown. Test audio cannot replace an active real alert. Windows volume
+and the selected output device still determine whether any sound can be heard.
+
+## Start at Windows login
+
+After copying the release build to `dist\AstralPowerMonitor.exe`, quit the current
+monitor and run `scripts\Install-Startup.ps1`. This copies the executable to
+`%LOCALAPPDATA%\AstralPowerMonitor\AstralPowerMonitor.exe` and creates
+`Astral Power Monitor.lnk` in this user's Windows Startup folder, targeting `--tray`.
+It does not install a service, scheduled task, restart policy, or automatic arming.
+The installation is specific to the current user and uses their ordinary login privileges.
+Every login starts with protection disarmed and sound warnings enabled.
+
+To enable GPU limiting, quit that ordinary instance and run the installed executable
+as administrator before manually arming. To disable startup, run
+`scripts\Remove-Startup.ps1` or remove the named startup shortcut. The removal script
+verifies its target and preserves the executable, history, and recovery files.
 
 ## Protection (manual arming)
 
@@ -115,23 +157,25 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo build --release --locked
 ```
 
-The native interface uses Windows controls and GDI. The compiled executable is roughly
-580 KiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
+The native interface uses Windows controls and GDI. The compiled executable, including
+the embedded sounds, is roughly 870 KiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
 NVML loaded exclusively from System32. Control selection requires one unambiguous match
 to the monitored card's subsystem ID, with UUID checks for saved-state restoration.
 
 The tests do not access GPU hardware. They cover pin ordering and units, malformed packets,
 high-current readings, stale/disconnected state, card selection, the native request layout,
 JSONL writing/rotation/tail recovery, every protection tier, grace periods, release/re-trigger,
-failed actions, recovery markers, and disarm/cancel races. Protection tests use fake actions
+failed actions, recovery markers, disarm/cancel races, audio thresholds, priority,
+muting, countdown cancellation, and playback failures. Protection/audio tests use fake actions
 and never shut down Windows or change the real GPU. Live hardware validation is a separate
 `--once` check; `--check-control` queries NVML without changing settings. Actual driver
 writes and Windows shutdown have not been exercised on the live machine during development.
 
 Each JSONL line is a JSON object with `schema_version`, `unix_time_ms`, and `type`.
 Sample records also contain `gpu`, a six-element `pins` array (`pin`, `volts`, `amps`,
-`watts`), and `connector_watts`. Event types are `startup`, `sensor_connected`, and
-`sensor_unavailable`, and `protection`. Protection events include an `action` and, where
+`watts`), and `connector_watts`. Event types are `startup`, `sensor_connected`,
+`sensor_unavailable`, `alert`, and `protection`. Advisory alert records include `tone`,
+`max_pin_amps`, and `muted`. Protection events include an `action` and, where
 applicable, `detail` and `max_pin_amps`. Repeated identical sensor errors are not logged
 on every retry.
 

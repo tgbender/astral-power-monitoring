@@ -1,4 +1,5 @@
 use crate::actions::{Gate, RealActions};
+use crate::audio::{Audio, Detector, Tone};
 use crate::protection::Protection;
 use crate::{model::State, monitor::AstralPowerMonitor};
 use std::fs::{File, OpenOptions};
@@ -16,6 +17,7 @@ pub struct Worker {
 #[derive(Clone)]
 pub struct Controls {
     pub gate: Arc<Gate>,
+    pub audio: Audio,
     sender: mpsc::Sender<Control>,
 }
 enum Control {
@@ -32,6 +34,7 @@ impl Controls {
     }
     pub fn disarm(&self) {
         self.gate.prevent_actions();
+        self.audio.cancel_countdown();
         let _ = self.sender.send(Control::Disarm);
     }
     pub fn restore(&self) {
@@ -52,6 +55,7 @@ impl Drop for Worker {
         self.controls.gate.prevent_actions();
         // Cancellation must finish before the process exits, not on a detached task.
         let _ = self.controls.gate.disarm_and_cancel();
+        self.controls.audio.quit();
     }
 }
 pub fn log_path() -> PathBuf {
@@ -225,8 +229,10 @@ impl Worker {
         let (sender, commands) = mpsc::channel::<Control>();
         let controls = Controls {
             gate: gate.clone(),
+            audio: Audio::start(gate.armed.clone()),
             sender,
         };
+        let audio = controls.audio.clone();
         std::thread::spawn(move || {
             let mut log = match JsonlLog::open(&log_path()) {
                 Ok(log) => Some(log),
@@ -242,6 +248,7 @@ impl Worker {
                 serde_json::json!({"type": "startup", "app_version": env!("CARGO_PKG_VERSION"),"protection_armed":false,"monitor_only":monitor_only}),
             );
             let mut protection = Protection::default();
+            let mut detector = Detector::default();
             let folder = log_path().parent().unwrap().to_path_buf();
             let marker = folder.join("mitigation.json");
             let mut actions: Option<RealActions> = None;
@@ -357,10 +364,28 @@ impl Worker {
                             state.gpu_name = name.into();
                             state.record(reading, now);
                         }
+                        // Advisory warnings remain active without arming protection.
+                        if let Some(tone) = detector.tick(now, reading.max_amps()) {
+                            audio.cue(tone);
+                            log_record(
+                                &mut log,
+                                &output,
+                                serde_json::json!({"type":"alert","tone":tone.name(),"max_pin_amps":reading.max_amps(),"muted":tone==Tone::Warning && audio.warning_muted.load(Ordering::SeqCst)}),
+                            );
+                        }
                         if gate.armed.load(Ordering::SeqCst)
                             && let Some(actions) = actions.as_mut()
                         {
                             for event in protection.tick(now, reading.max_amps(), actions) {
+                                match event.action {
+                                    "gpu_limited" => audio.cue(Tone::Limited),
+                                    "shutdown_requested"
+                                        if gate.pending() && gate.armed.load(Ordering::SeqCst) =>
+                                    {
+                                        audio.cue(Tone::Shutdown);
+                                    }
+                                    _ => {}
+                                }
                                 {
                                     let mut state =
                                         output.lock().unwrap_or_else(|p| p.into_inner());
@@ -391,6 +416,7 @@ impl Worker {
                     }
                     Err(error) => {
                         protection.reset_observations();
+                        detector.unavailable();
                         if last_sensor_error.as_deref() != Some(&error) {
                             log_record(
                                 &mut log,

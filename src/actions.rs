@@ -15,7 +15,7 @@ use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
 #[derive(Default)]
 pub struct Gate {
-    pub armed: AtomicBool,
+    pub armed: Arc<AtomicBool>,
     pub epoch: AtomicU64,
     pending: AtomicBool,
     shutdown_lock: Mutex<()>,
