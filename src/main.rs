@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod actions;
 mod audio;
+mod history;
 mod model;
 mod monitor;
 mod protection;
@@ -8,7 +9,12 @@ mod window;
 mod worker;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "--cancel-shutdown") {
+    if args.first().is_some_and(|a| a == "--quit") {
+        if let Err(error) = window::request_exit() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    } else if args.first().is_some_and(|a| a == "--cancel-shutdown") {
         if let Err(error) = actions::emergency_cancel() {
             eprintln!("{error}");
             std::process::exit(1);
@@ -51,7 +57,7 @@ fn main() {
         }
     } else if args.first().is_some_and(|a| a == "--help") {
         println!(
-            "GUI starts disarmed; arm manually from the tray. --tray hides the window; --monitor-only disables arming; --once/--samples N reads sensors; --check-control checks NVML without writes; --cancel-shutdown aborts a pending Windows shutdown."
+            "GUI starts disarmed; arm manually from the tray. --tray hides the window; --monitor-only disables arming; --once/--samples N reads sensors; --check-control checks NVML without writes; --cancel-shutdown aborts a pending Windows shutdown; --quit gracefully stops the running app and flushes history."
         );
     } else if let Err(error) = window::run(
         args.iter().any(|a| a == "--tray"),

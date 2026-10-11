@@ -1,2 +1,5 @@
 /target
 /dist
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

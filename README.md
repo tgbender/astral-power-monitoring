@@ -11,10 +11,11 @@ extended from [Timic3/astral-power-monitoring](https://github.com/Timic3/astral-
 - Marks readings unavailable after a read failure or three seconds without a fresh sample.
 - Reconnects every five seconds after sensor/driver failures.
 - Displays a warning at 9.2 A; this is a display warning, not an automatic intervention.
-- Saves a JSONL sample about once per second to `%LOCALAPPDATA%\AstralPowerMonitor\readings.jsonl`.
+- Records every successful half-second sample in `%LOCALAPPDATA%\AstralPowerMonitor\readings.sqlite`.
 - Records startup and sensor connection/unavailability events alongside samples.
-- Rotates JSONL at 5 MiB and retains three older files (`readings.1.jsonl` through `.3.jsonl`).
-- Repairs an incomplete final record on startup. Existing CSV history is preserved.
+- Batches ordinary samples into SQLite transactions once per minute; warning/current and lifecycle events commit sooner.
+- Prunes database records older than 24 hours on startup and every ten minutes.
+- Imports the last day's legacy JSONL once, ignoring malformed/incomplete lines. Original CSV and JSONL files are preserved.
 - Allows only one GUI instance per Windows session.
 - Uses a teal GPU tray/taskbar icon with six gold contacts; warnings use an amber exclamation version.
 - Provides manually armed GPU limiting and Windows power-off protection using the Python guard's default ladder.
@@ -28,7 +29,8 @@ temperature measurements or a guarantee against connector damage.
 
 Launch `AstralPowerMonitor.exe` (the release build is named `astral_power_monitoring.exe`).
 Closing the window hides it while monitoring continues. Click the tray icon to show it.
-Right-click the tray icon or the readings window for Show readings, Open JSONL history,
+Right-click the tray icon or the readings window for Show readings, Open SQLite history folder,
+Flush buffered history now,
 Reset session peaks, Arm protection, Disarm / Cancel, Restore saved GPU settings,
 Test all four sounds, Mute warning chime, and Quit.
 Launching it again restores the existing window.
@@ -160,26 +162,79 @@ cargo build --release --locked
 ```
 
 The native interface uses Windows controls and GDI. The compiled executable, including
-the embedded sounds and icon resources, is roughly 1.5 MiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
+the embedded sounds, icon resources, and SQLite, is roughly 3.2 MiB. Sensor access uses NVIDIA's installed NVAPI driver library; GPU limiting uses
 NVML loaded exclusively from System32. Control selection requires one unambiguous match
 to the monitored card's subsystem ID, with UUID checks for saved-state restoration.
 
 The tests do not access GPU hardware. They cover pin ordering and units, malformed packets,
 high-current readings, stale/disconnected state, card selection, the native request layout,
-JSONL writing/rotation/tail recovery, every protection tier, grace periods, release/re-trigger,
+SQLite batching, retention, legacy import, transactional failure/retry, bounded logging queues,
+every protection tier, grace periods, release/re-trigger,
 failed actions, recovery markers, disarm/cancel races, audio thresholds, priority,
 muting, countdown cancellation, and playback failures. Protection/audio tests use fake actions
 and never shut down Windows or change the real GPU. Live hardware validation is a separate
 `--once` check; `--check-control` queries NVML without changing settings. Actual driver
 writes and Windows shutdown have not been exercised on the live machine during development.
 
-Each JSONL line is a JSON object with `schema_version`, `unix_time_ms`, and `type`.
-Sample records also contain `gpu`, a six-element `pins` array (`pin`, `volts`, `amps`,
-`watts`), and `connector_watts`. Event types are `startup`, `sensor_connected`,
-`sensor_unavailable`, `alert`, and `protection`. Advisory alert records include `tone`,
-`max_pin_amps`, and `muted`. Protection events include an `action` and, where
-applicable, `detail` and `max_pin_amps`. Repeated identical sensor errors are not logged
-on every retry.
+## SQLite history and querying
+
+The app embeds SQLite; no external DLL, service, Python runtime, or SQLite executable
+is needed. A dedicated writer collects every successful 500 ms sensor sample and
+normally commits a batch once every 60 s. Samples retain their measurement timestamp,
+not the time of the later commit. WAL mode allows independent read-only queries while
+monitoring continues. `synchronous=FULL` syncs each completed transaction; memory that
+has not yet been committed can still be lost in a hard crash or power cut.
+
+At the visual warning level (any pin at least 9.2 A), entering the warning area requests
+an immediate commit and continued warnings commit about once a second. Critical
+samples at least 13 A request a commit on each poll. Events also request early commits.
+These are logging rules; GPU limiting/shutdown still use the original protection ladder.
+No connector temperature sensor is available: warning flushing is based on current.
+
+An accepted quit stops sampling, drains pending history, and waits up to one second
+for the writer. `--quit` requests that graceful exit from another process without any
+mouse/keyboard input. Windows session-end messages also request bounded flushes.
+Before the app requests its own protective power-off, it records the reason and waits
+at most 200 ms for history; storage failure/timeout cannot prevent shutdown. Sudden
+power cuts, hard resets, or forced process termination provide no flush opportunity:
+up to one minute of normal readings may be lost. Slow/failed storage can lose more.
+
+On startup and every ten minutes, records with timestamps strictly older than 24 h
+are deleted. Free pages are reused and reclaimed incrementally; the whole database
+is not rewritten every minute. Long-running external read transactions can delay WAL
+checkpointing, so close queries when finished. Preserve the `.sqlite`, `-wal`, and
+`-shm` files together while the app is running; a commit can be durable in the WAL
+without yet being copied into the main database file.
+
+The writer retries storage errors every ten seconds. Its queue and memory buffer are
+bounded to 2,048 records each. Overflow drops records (oldest buffered samples first),
+and the window reports errors and a persistent dropped-record count for the session.
+Sampling, sound alerts, and protective decisions continue independently of disk writes.
+
+Tables/views:
+
+- `samples`: `id`, `unix_time_ms` (UTC milliseconds), `gpu`, `connector_watts`,
+  `max_pin_amps`, and `p1_volts`/`p1_amps` through `p6_volts`/`p6_amps`.
+- `pin_readings`: a view with six rows per sample: `sample_id`, `unix_time_ms`,
+  `gpu`, `pin`, `volts`, `amps`, and calculated `watts`.
+- `events`: UTC timestamp, `type`, optional `action`, and structured `details_json`.
+- `metadata`: migration/import bookkeeping. Schema identity uses SQLite application
+  ID `0x41504d31` and `user_version=1`.
+
+The first open imports recent valid records from `readings.jsonl` and its three archives
+in one transaction, recording completion so subsequent starts do not duplicate history.
+Existing legacy files are left untouched and are outside the database's retention policy.
+
+[queries/history.sql](queries/history.sql) contains read-only examples for recent
+power/current, pin 5 vs pin 6, per-pin peaks, warnings, and events. With an optional
+SQLite CLI installed, from the repository root:
+
+```powershell
+sqlite3 -readonly "$env:LOCALAPPDATA\AstralPowerMonitor\readings.sqlite" ".read queries/history.sql"
+```
+
+Ordinary recent readings may still be buffered; choose **Flush buffered history now**
+from the tray menu before querying if you need the latest samples.
 
 ## Sensor protocol and supported cards
 

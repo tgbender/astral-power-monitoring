@@ -44,6 +44,11 @@ impl Gate {
     pub fn pending(&self) -> bool {
         self.pending.load(Ordering::SeqCst)
     }
+    pub fn ending_session(&self) {
+        self.prevent_actions();
+        // Windows is already ending the session. App cleanup must not abort it.
+        self.pending.store(false, Ordering::SeqCst);
+    }
     pub fn try_arm(&self, epoch: u64) -> bool {
         let _guard = self.arm_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.epoch.load(Ordering::SeqCst) != epoch
@@ -95,7 +100,7 @@ pub fn emergency_cancel() -> Result<(), String> {
 }
 
 // A replacement is complete before it overwrites the prior recovery information.
-fn save_marker(path: &Path, record: &Value) -> Result<(), String> {
+pub(crate) fn save_marker(path: &Path, record: &Value) -> Result<(), String> {
     let parent = path.parent().ok_or("Invalid marker path")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let temporary = path.with_extension("tmp");
@@ -281,7 +286,7 @@ impl<D: Driver> Mitigation<D> {
 pub struct RealActions {
     gate: Arc<Gate>,
     mitigation: Result<Mitigation<Nvml>, String>,
-    folder: PathBuf,
+    history: Option<crate::history::History>,
 }
 impl RealActions {
     pub fn new(subsystem: u32, folder: PathBuf, gate: Arc<Gate>) -> Self {
@@ -292,8 +297,12 @@ impl RealActions {
         Self {
             gate,
             mitigation,
-            folder,
+            history: None,
         }
+    }
+    pub fn with_history(mut self, history: crate::history::History) -> Self {
+        self.history = Some(history);
+        self
     }
     pub fn readiness(&self) -> String {
         match &self.mitigation {
@@ -332,11 +341,14 @@ impl Actions for RealActions {
             .restore(None)
     }
     fn shutdown(&mut self, reason: &str) -> Result<(), String> {
-        let marker = json!({"schema_version":1,"reason":reason,"unix_time_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64});
         // Record a reason separately from rotating history; logging failure must
         // never prevent an already-armed protective power-off.
         self.gate.request_with(|| {
-            let _ = save_marker(&self.folder.join("last_shutdown.json"), &marker);
+            if let Some(history)=&self.history {
+                history.event(json!({"type":"protection","action":"shutdown_about_to_request","reason":reason}));
+                // Disk I/O can never hold up an emergency power-off indefinitely.
+                let _=history.flush(crate::history::SHUTDOWN_FLUSH_TIMEOUT);
+            }
             shutdown_command(&["/s", "/t", "5", "/f", "/c", reason])
         })
     }
@@ -717,6 +729,17 @@ mod tests {
         assert!(!gate.armed.load(Ordering::SeqCst));
         assert!(gate.try_arm(gate.epoch.load(Ordering::SeqCst)));
         assert!(!gate.try_arm(gate.epoch.load(Ordering::SeqCst)));
+    }
+    #[test]
+    fn session_ending_does_not_abort_an_accepted_shutdown_during_cleanup() {
+        let gate = Gate::default();
+        assert!(gate.try_arm(0));
+        gate.request_with(|| Ok(())).unwrap();
+        gate.ending_session();
+        gate.cancel_with(|| panic!("cleanup must not abort Windows session shutdown"))
+            .unwrap();
+        assert!(!gate.armed.load(Ordering::SeqCst));
+        assert!(!gate.pending());
     }
     #[test]
     fn disarm_prevents_shutdown_and_failed_requests_do_not_latch() {

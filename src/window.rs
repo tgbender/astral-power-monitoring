@@ -4,7 +4,7 @@ use crate::worker::{Controls, Shared, Worker};
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -22,6 +22,7 @@ const DISARM: usize = 105;
 const RESTORE: usize = 106;
 const TEST_SOUNDS: usize = 107;
 const MUTE_WARNING: usize = 108;
+const FLUSH_HISTORY: usize = 109;
 const MONITOR_ONLY: u32 = WM_APP + 2;
 const CLASS: &str = "AstralPowerMonitorRustWindow";
 
@@ -414,12 +415,23 @@ unsafe fn paint(hwnd: HWND, app: &App) {
             muted,
             app.small_font,
         );
-        let log_status = state
-            .log_error
+        let history = app.controls.history.status();
+        let log_status = history
+            .error
             .as_ref()
-            .map(|e| format!("JSONL logging unavailable: {e}"))
+            .map(|e| format!("SQLite history unavailable: {e}"))
             .unwrap_or_else(|| {
-                "JSONL history is saved locally · open it from the tray menu".into()
+                if history.dropped > 0 {
+                    format!(
+                        "History lost {} records during a storage failure",
+                        history.dropped
+                    )
+                } else {
+                    format!(
+                        "SQLite history · 24 h retention · {} records buffered",
+                        history.pending
+                    )
+                }
             });
         text(
             dc,
@@ -427,7 +439,7 @@ unsafe fn paint(hwnd: HWND, app: &App) {
             528,
             650,
             &log_status,
-            if state.log_error.is_some() {
+            if history.error.is_some() || history.dropped > 0 {
                 amber
             } else {
                 muted
@@ -547,6 +559,24 @@ unsafe extern "system" fn window_proc(
                 ShowWindow(hwnd, SW_HIDE);
                 0
             }
+            WM_QUERYENDSESSION => {
+                APP.with(|cell|{if let Some(app)=cell.borrow().as_ref(){
+                    app.controls.history.event(serde_json::json!({"type":"system_shutdown","action":"query_end_session"}));
+                    let _=app.controls.history.flush(Duration::from_millis(500));
+                }});
+                1
+            }
+            WM_ENDSESSION => {
+                if wparam != 0 {
+                    APP.with(|cell|{if let Some(app)=cell.borrow().as_ref(){
+                    app.controls.gate.ending_session();
+                    app.controls.history.event(serde_json::json!({"type":"system_shutdown","action":"end_session"}));
+                    let _=app.controls.history.flush(Duration::from_millis(500));
+                }});
+                    PostQuitMessage(0);
+                }
+                0
+            }
             WM_CONTEXTMENU => {
                 APP.with(|cell| {
                     if let Ok(app) = cell.try_borrow()
@@ -644,6 +674,13 @@ unsafe extern "system" fn window_proc(
                             }
                         });
                     }
+                    FLUSH_HISTORY => {
+                        APP.with(|cell| {
+                            if let Some(app) = cell.borrow().as_ref() {
+                                let _ = app.controls.history.flush(Duration::from_millis(500));
+                            }
+                        });
+                    }
                     LOGS => {
                         APP.with(|cell| {
                             if let Ok(app) = cell.try_borrow()
@@ -707,6 +744,18 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+pub fn request_exit() -> Result<(), String> {
+    unsafe {
+        let window = FindWindowW(wide(CLASS).as_ptr(), null());
+        if window.is_null() {
+            return Ok(());
+        }
+        if PostMessageW(window, WM_COMMAND, QUIT, 0) == 0 {
+            return Err("Cannot quit the running monitor; matching administrator privileges may be required".into());
+        }
+    }
+    Ok(())
+}
 pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
     unsafe {
         let mutex = CreateMutexW(null(), 0, wide("Local\\AstralPowerMonitorRust").as_ptr());
@@ -769,7 +818,8 @@ pub fn run(start_hidden: bool, monitor_only: bool) -> Result<(), String> {
         let menu = CreatePopupMenu();
         for (id, label) in [
             (SHOW, "Show readings"),
-            (LOGS, "Open JSONL history"),
+            (LOGS, "Open SQLite history folder"),
+            (FLUSH_HISTORY, "Flush buffered history now"),
             (RESET, "Reset session peaks"),
             (ARM, "Arm protection for this session…"),
             (DISARM, "Disarm / Cancel pending power-off"),
